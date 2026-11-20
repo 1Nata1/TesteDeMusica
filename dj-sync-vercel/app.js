@@ -38,6 +38,9 @@
   let lastState = null;
   let loadedVideoId = null;
   let draggingSeek = false;
+  let clockOffset = null; // servidor - cliente (ms); corrige relógios diferentes
+  let forceNextApply = false;
+  let lastSeekAt = 0;
 
   const urlRoom = location.pathname.match(/^\/r\/([A-Za-z0-9]{3,10})\/?$/)?.[1];
   if (urlRoom) $('join-code').value = urlRoom.toUpperCase();
@@ -75,9 +78,23 @@
     }
   }
 
+  // O relógio de cada computador pode estar adiantado/atrasado em relação ao servidor.
+  // state.serverTime foi gerado no servidor; a amostra abaixo é (servidor - cliente)
+  // descontada da latência. Mantemos a maior amostra (menor latência) para compensar o desvio.
+  function noteServerTime(state) {
+    if (!state?.serverTime) return;
+    const sample = state.serverTime - Date.now();
+    if (clockOffset === null || Math.abs(sample - clockOffset) > 5000) {
+      clockOffset = sample;
+    } else {
+      clockOffset = Math.max(clockOffset, sample);
+    }
+  }
+
   function expectedPosition(state) {
     if (!state) return 0;
-    return Math.max(0, state.position + (state.playing ? (Date.now() - state.serverTime) / 1000 : 0));
+    const now = Date.now() + (clockOffset ?? 0);
+    return Math.max(0, state.position + (state.playing ? (now - state.serverTime) / 1000 : 0));
   }
 
   // --------------------------------------------------- YouTube IFrame API
@@ -165,15 +182,19 @@
       return;
     }
 
-    const current = player.getCurrentTime?.() || 0;
-    const drift = position - current;
-
-    if (force || Math.abs(drift) > 1.4) {
-      if (state.playing && Math.abs(drift) > 0.35) player.seekTo(Math.max(0, position), true);
-      else if (!state.playing && Math.abs(drift) > 0.6) player.seekTo(Math.max(0, position), true);
+    const nativeState = player.getPlayerState?.();
+    // Só corrige a posição quando o player já tem um vídeo carregado (1, 2 ou 5).
+    if (nativeState === 1 || nativeState === 2 || nativeState === 5) {
+      const current = player.getCurrentTime?.() || 0;
+      const drift = position - current;
+      // tolerance baixa: um desvio de ~1s precisa ser corrigido, não ignorado.
+      const threshold = force ? 0.12 : (state.playing ? 0.35 : 0.25);
+      if (Math.abs(drift) > threshold && (force || Date.now() - lastSeekAt > 800)) {
+        player.seekTo(Math.max(0, position), true);
+        lastSeekAt = Date.now();
+      }
     }
 
-    const nativeState = player.getPlayerState?.();
     if (state.playing) {
       if (nativeState !== 1) player.playVideo();
     } else if (nativeState === 1) {
@@ -258,6 +279,7 @@
   }
 
   function render(state) {
+    noteServerTime(state);
     lastState = state;
     $('room-code').textContent = state.code;
     $('listener-count').textContent = `👤 ${state.listeners}`;
@@ -282,7 +304,8 @@
       if (Number.isFinite(duration) && duration > 0) $('seek').max = String(Math.floor(duration));
     }
 
-    applyState();
+    applyState(forceNextApply);
+    forceNextApply = false;
   }
 
   // ------------------------------------------------------------ conexão
@@ -296,6 +319,9 @@
     $('app').classList.remove('hidden');
     manualLeave = false;
     fatalError = false;
+    clockOffset = null;
+    lastSeekAt = 0;
+    forceNextApply = true; // alinha já no primeiro estado recebido
     connect();
     loadYouTubeApi();
   }
@@ -391,8 +417,9 @@
   $('clear-btn').addEventListener('click', () => send('clearQueue'));
   $('allow-requests').addEventListener('change', (e) => send('setAllowRequests', { value: e.target.checked }));
   $('resync-btn').addEventListener('click', () => {
+    // Força o seek quando a resposta do servidor chegar (com serverTime fresco).
+    forceNextApply = true;
     send('syncRequest');
-    applyState(true);
     toast('Sincronizando com o servidor...');
   });
 
