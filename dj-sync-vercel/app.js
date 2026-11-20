@@ -127,8 +127,13 @@
           player.unMute();
           if (lastState) applyState(true);
         },
-        onStateChange: () => {
+        onStateChange: (event) => {
           updatePlayButton();
+          // 0 = ENDED: o DJ avança a fila (ou pausa se não houver próxima).
+          if (event.data === 0 && lastState?.isHost && loadedVideoId === lastState.current?.videoId) {
+            if (lastState.queue?.length) send('next');
+            else send('pause');
+          }
         },
       },
     });
@@ -183,6 +188,8 @@
     }
 
     const nativeState = player.getPlayerState?.();
+    // 0 = ENDED: não faz seek nem chama playVideo(), senão a música reinicia.
+    if (nativeState === 0) return;
     // Só corrige a posição quando o player já tem um vídeo carregado (1, 2 ou 5).
     if (nativeState === 1 || nativeState === 2 || nativeState === 5) {
       const current = player.getCurrentTime?.() || 0;
