@@ -260,6 +260,21 @@
     });
   }
 
+  // Uma música por pessoa na lista: se pedir de novo, fica só a entrada mais recente.
+  function uniqueRequests(tracks) {
+    const byVideo = new Map();
+    for (const track of Array.isArray(tracks) ? tracks : []) {
+      if (!track || !track.videoId) continue;
+      const previous = byVideo.get(track.videoId);
+      if (!previous || Number(track.addedAt || 0) >= Number(previous.addedAt || 0)) {
+        byVideo.set(track.videoId, track);
+      }
+    }
+    return Array.from(byVideo.values())
+      .sort((a, b) => Number(a.addedAt || 0) - Number(b.addedAt || 0))
+      .slice(-60);
+  }
+
   // Histórico de pedidos: o servidor manda o que sabe e o navegador guarda uma cópia.
   // Assim o histórico sobrevive a um restart do servidor (no plano free da Render).
   function mergedRequests(incoming) {
@@ -268,13 +283,14 @@
     try { saved = JSON.parse(localStorage.getItem(key) || '{}') || {}; } catch { saved = {}; }
 
     let changed = false;
-    for (const [user, tracks] of Object.entries(incoming || {})) {
-      const list = Array.isArray(tracks) ? tracks : [];
-      const existing = Array.isArray(saved[user]) ? saved[user] : [];
-      const known = new Set(existing.map((t) => `${t.addedAt}:${t.videoId}`));
-      const fresh = list.filter((t) => !known.has(`${t.addedAt}:${t.videoId}`));
-      if (fresh.length) {
-        saved[user] = existing.concat(fresh).slice(-60);
+    const users = new Set([...Object.keys(saved), ...Object.keys(incoming || {})]);
+    for (const user of users) {
+      const merged = uniqueRequests([
+        ...(Array.isArray(saved[user]) ? saved[user] : []),
+        ...(Array.isArray(incoming?.[user]) ? incoming[user] : []),
+      ]);
+      if (JSON.stringify(merged) !== JSON.stringify(saved[user] || [])) {
+        saved[user] = merged;
         changed = true;
       }
     }
@@ -317,7 +333,7 @@
     $('requests-list').querySelectorAll('.request-add').forEach((btn) => {
       btn.addEventListener('click', () => {
         send('add', { url: btn.dataset.video });
-        toast('Música adicionada à fila!');
+        toast('Adicionando à fila...');
       });
     });
     return all;
