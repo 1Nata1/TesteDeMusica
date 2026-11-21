@@ -206,6 +206,14 @@ h1 span, .brand span { color: var(--accent-2); }
 .queue-remove:hover { color: var(--danger); }
 .empty { color: var(--muted); font-size: 13px; text-align: center; padding: 22px 10px; border: 1px dashed var(--line); border-radius: 10px; }
 
+.requests-list { margin-top: 12px; display: grid; gap: 10px; max-height: 360px; overflow-y: auto; }
+.request-user { font-size: 13px; font-weight: 700; color: var(--accent-2); display: flex; justify-content: space-between; gap: 8px; margin-bottom: 5px; }
+.request-user span { color: var(--muted); font-weight: 400; font-size: 11px; }
+.request-song { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 5px 6px; border-radius: 7px; background: var(--panel-2); margin-top: 4px; }
+.request-song-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.request-add { flex: none; background: transparent; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); font-size: 11px; padding: 3px 7px; cursor: pointer; }
+.request-add:hover { color: var(--good); border-color: var(--good); }
+
 .chat-panel { display: flex; flex-direction: column; }
 .messages { height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 4px 2px 12px; }
 .msg { font-size: 13px; line-height: 1.45; word-break: break-word; }
