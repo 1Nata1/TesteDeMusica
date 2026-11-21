@@ -286,6 +286,9 @@
 
   function renderRequests(state) {
     const all = mergedRequests(state.userRequests);
+    // HTML antigo pode não ter o painel ainda. Nunca deixe isso quebrar o render(),
+    // senão a sincronização e os controles param de funcionar.
+    if (!$('requests-count') || !$('requests-list')) return all;
     const entries = Object.entries(all)
       .map(([user, tracks]) => ({ user, tracks: Array.isArray(tracks) ? tracks : [] }))
       .filter((entry) => entry.tracks.length)
