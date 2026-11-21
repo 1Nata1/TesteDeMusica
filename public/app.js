@@ -38,6 +38,10 @@
   let lastState = null;
   let loadedVideoId = null;
   let draggingSeek = false;
+  let clockOffset = null; // servidor - cliente (ms); corrige relógios diferentes
+  let forceNextApply = false;
+  let lastSeekAt = 0;
+  let restoreAttempted = false;
 
   const urlRoom = location.pathname.match(/^\/r\/([A-Za-z0-9]{3,10})\/?$/)?.[1];
   if (urlRoom) $('join-code').value = urlRoom.toUpperCase();
@@ -75,9 +79,23 @@
     }
   }
 
+  // O relógio de cada computador pode estar adiantado/atrasado em relação ao servidor.
+  // state.serverTime foi gerado no servidor; a amostra abaixo é (servidor - cliente)
+  // descontada da latência. Mantemos a maior amostra (menor latência) para compensar o desvio.
+  function noteServerTime(state) {
+    if (!state?.serverTime) return;
+    const sample = state.serverTime - Date.now();
+    if (clockOffset === null || Math.abs(sample - clockOffset) > 5000) {
+      clockOffset = sample;
+    } else {
+      clockOffset = Math.max(clockOffset, sample);
+    }
+  }
+
   function expectedPosition(state) {
     if (!state) return 0;
-    return Math.max(0, state.position + (state.playing ? (Date.now() - state.serverTime) / 1000 : 0));
+    const now = Date.now() + (clockOffset ?? 0);
+    return Math.max(0, state.position + (state.playing ? (now - state.serverTime) / 1000 : 0));
   }
 
   // --------------------------------------------------- YouTube IFrame API
@@ -110,8 +128,13 @@
           player.unMute();
           if (lastState) applyState(true);
         },
-        onStateChange: () => {
+        onStateChange: (event) => {
           updatePlayButton();
+          // 0 = ENDED: o DJ avança a fila (ou pausa se não houver próxima).
+          if (event.data === 0 && lastState?.isHost && loadedVideoId === lastState.current?.videoId) {
+            if (lastState.queue?.length) send('next');
+            else send('pause');
+          }
         },
       },
     });
@@ -165,15 +188,21 @@
       return;
     }
 
-    const current = player.getCurrentTime?.() || 0;
-    const drift = position - current;
-
-    if (force || Math.abs(drift) > 1.4) {
-      if (state.playing && Math.abs(drift) > 0.35) player.seekTo(Math.max(0, position), true);
-      else if (!state.playing && Math.abs(drift) > 0.6) player.seekTo(Math.max(0, position), true);
+    const nativeState = player.getPlayerState?.();
+    // 0 = ENDED: não faz seek nem chama playVideo(), senão a música reinicia.
+    if (nativeState === 0) return;
+    // Só corrige a posição quando o player já tem um vídeo carregado (1, 2 ou 5).
+    if (nativeState === 1 || nativeState === 2 || nativeState === 5) {
+      const current = player.getCurrentTime?.() || 0;
+      const drift = position - current;
+      // tolerance baixa: um desvio de ~1s precisa ser corrigido, não ignorado.
+      const threshold = force ? 0.12 : (state.playing ? 0.35 : 0.25);
+      if (Math.abs(drift) > threshold && (force || Date.now() - lastSeekAt > 800)) {
+        player.seekTo(Math.max(0, position), true);
+        lastSeekAt = Date.now();
+      }
     }
 
-    const nativeState = player.getPlayerState?.();
     if (state.playing) {
       if (nativeState !== 1) player.playVideo();
     } else if (nativeState === 1) {
@@ -231,6 +260,66 @@
     });
   }
 
+  // Histórico de pedidos: o servidor manda o que sabe e o navegador guarda uma cópia.
+  // Assim o histórico sobrevive a um restart do servidor (no plano free da Render).
+  function mergedRequests(incoming) {
+    const key = `dj-sync-requests:${roomCode}`;
+    let saved = {};
+    try { saved = JSON.parse(localStorage.getItem(key) || '{}') || {}; } catch { saved = {}; }
+
+    let changed = false;
+    for (const [user, tracks] of Object.entries(incoming || {})) {
+      const list = Array.isArray(tracks) ? tracks : [];
+      const existing = Array.isArray(saved[user]) ? saved[user] : [];
+      const known = new Set(existing.map((t) => `${t.addedAt}:${t.videoId}`));
+      const fresh = list.filter((t) => !known.has(`${t.addedAt}:${t.videoId}`));
+      if (fresh.length) {
+        saved[user] = existing.concat(fresh).slice(-60);
+        changed = true;
+      }
+    }
+    if (changed) {
+      try { localStorage.setItem(key, JSON.stringify(saved)); } catch { /* sem espaço */ }
+    }
+    return saved;
+  }
+
+  function renderRequests(state) {
+    const all = mergedRequests(state.userRequests);
+    const entries = Object.entries(all)
+      .map(([user, tracks]) => ({ user, tracks: Array.isArray(tracks) ? tracks : [] }))
+      .filter((entry) => entry.tracks.length)
+      .sort((a, b) => b.tracks.length - a.tracks.length || a.user.localeCompare(b.user));
+
+    $('requests-count').textContent = String(entries.reduce((n, e) => n + e.tracks.length, 0));
+
+    if (!entries.length) {
+      $('requests-list').innerHTML = '<div class="empty">Ninguém pediu músicas ainda.</div>';
+      return all;
+    }
+
+    $('requests-list').innerHTML = entries.map(({ user, tracks }) => `
+      <div class="request-user">
+        <strong>${esc(user)}</strong>
+        <span>${tracks.length} pedido${tracks.length === 1 ? '' : 's'}</span>
+      </div>
+      ${tracks.slice().reverse().slice(0, 12).map((t) => `
+        <div class="request-song">
+          <span class="request-song-title" title="${esc(t.title)}">${esc(t.title)}</span>
+          <button class="request-add" data-video="${esc(t.videoId)}" title="Colocar na fila">+ fila</button>
+        </div>
+      `).join('')}
+    `).join('');
+
+    $('requests-list').querySelectorAll('.request-add').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        send('add', { url: btn.dataset.video });
+        toast('Música adicionada à fila!');
+      });
+    });
+    return all;
+  }
+
   function renderMessages(state) {
     const box = $('messages');
     const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 70;
@@ -258,6 +347,7 @@
   }
 
   function render(state) {
+    noteServerTime(state);
     lastState = state;
     $('room-code').textContent = state.code;
     $('listener-count').textContent = `👤 ${state.listeners}`;
@@ -269,6 +359,15 @@
 
     renderNowPlaying(state);
     renderQueue(state);
+    const savedRequests = renderRequests(state);
+    // Servidor reiniciou e perdeu o histórico: o DJ devolve a cópia do navegador.
+    if (
+      state.isHost && !restoreAttempted &&
+      !Object.keys(state.userRequests || {}).length && Object.keys(savedRequests).length
+    ) {
+      restoreAttempted = true;
+      send('restoreRequests', { requests: savedRequests });
+    }
     renderMessages(state);
     updatePlayButton();
 
@@ -282,7 +381,8 @@
       if (Number.isFinite(duration) && duration > 0) $('seek').max = String(Math.floor(duration));
     }
 
-    applyState();
+    applyState(forceNextApply);
+    forceNextApply = false;
   }
 
   // ------------------------------------------------------------ conexão
@@ -296,6 +396,10 @@
     $('app').classList.remove('hidden');
     manualLeave = false;
     fatalError = false;
+    clockOffset = null;
+    lastSeekAt = 0;
+    restoreAttempted = false;
+    forceNextApply = true; // alinha já no primeiro estado recebido
     connect();
     loadYouTubeApi();
   }
@@ -391,8 +495,9 @@
   $('clear-btn').addEventListener('click', () => send('clearQueue'));
   $('allow-requests').addEventListener('change', (e) => send('setAllowRequests', { value: e.target.checked }));
   $('resync-btn').addEventListener('click', () => {
+    // Força o seek quando a resposta do servidor chegar (com serverTime fresco).
+    forceNextApply = true;
     send('syncRequest');
-    applyState(true);
     toast('Sincronizando com o servidor...');
   });
 
