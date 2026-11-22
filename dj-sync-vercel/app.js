@@ -49,6 +49,7 @@
   let gainsRestoreAttempted = false;
   let gainPanel = null;
   let gainValueEl = null;
+  let gainBadgeEl = null;
 
   const urlRoom = location.pathname.match(/^\/r\/([A-Za-z0-9]{3,10})\/?$/)?.[1];
   if (urlRoom) $('join-code').value = urlRoom.toUpperCase();
@@ -374,6 +375,9 @@
         .gain-panel { margin-top: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 14px; }
         .gain-head { display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: 800; color: var(--accent-2); margin-bottom: 8px; }
         .gain-head span:last-child { color: var(--muted); font-variant-numeric: tabular-nums; }
+        .gain-badge { display: inline-block; margin-right: 6px; padding: 2px 7px; border-radius: 999px; font-size: 10px; background: rgba(168,85,247,.18); color: var(--accent); }
+        .gain-badge.down { background: rgba(56,189,248,.16); color: #7dd3fc; }
+        .gain-badge.up { background: rgba(250,204,21,.16); color: #fde047; }
         .gain-row { display: flex; gap: 8px; }
         .gain-btn { flex: 1; height: 34px; cursor: pointer; color: #fff; background: #241f4c; border: 1px solid var(--line); border-radius: 9px; font-size: 15px; }
         .gain-btn:hover { border-color: var(--accent); }
@@ -385,7 +389,7 @@
     const panel = document.createElement('section');
     panel.className = 'gain-panel';
     panel.innerHTML = `
-      <div class="gain-head"><span>🔊 Volume da faixa</span><span id="gain-value">100%</span></div>
+      <div class="gain-head"><span>🔊 Volume da faixa</span><span><span id="gain-badge" class="gain-badge">sem ajuste</span><span id="gain-value">100%</span></span></div>
       <div class="gain-row">
         <button id="gain-minus" class="gain-btn" type="button" title="Diminuir">−</button>
         <button id="gain-reset" class="gain-btn" type="button" title="Voltar ao normal">↺</button>
@@ -396,6 +400,7 @@
     (document.querySelector('.stage') || document.body).appendChild(panel);
     gainPanel = panel;
     gainValueEl = $('gain-value');
+    gainBadgeEl = $('gain-badge');
 
     $('gain-minus').addEventListener('click', () => changeGain(-0.1));
     $('gain-plus').addEventListener('click', () => changeGain(0.1));
@@ -416,7 +421,19 @@
     try { ensureGainPanel(); } catch { return; }
     gainPanel.classList.toggle('hidden', !state.isHost);
     if (!state.isHost) return;
-    gainValueEl.textContent = `${Math.round(currentGain(state) * 100)}%`;
+    const gain = currentGain(state);
+    gainValueEl.textContent = `${Math.round(gain * 100)}%`;
+    const diff = Math.round(Math.abs(gain - 1) * 100);
+    if (!state.current || diff < 1) {
+      gainBadgeEl.textContent = 'sem ajuste';
+      gainBadgeEl.className = 'gain-badge';
+    } else if (gain < 1) {
+      gainBadgeEl.textContent = `↓ ${diff}%`;
+      gainBadgeEl.className = 'gain-badge down';
+    } else {
+      gainBadgeEl.textContent = `↑ ${diff}%`;
+      gainBadgeEl.className = 'gain-badge up';
+    }
   }
 
   // --------------------------------------------------- YouTube IFrame API
