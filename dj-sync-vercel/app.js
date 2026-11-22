@@ -42,6 +42,12 @@
   let forceNextApply = false;
   let lastSeekAt = 0;
   let restoreAttempted = false;
+  let appliedVolume = -1;
+  const GAINS_STORAGE = 'dj-sync-gains:';
+  let gainsCache = {};
+  let gainsRestoreAttempted = false;
+  let gainPanel = null;
+  let gainValueEl = null;
 
   const urlRoom = location.pathname.match(/^\/r\/([A-Za-z0-9]{3,10})\/?$/)?.[1];
   if (urlRoom) $('join-code').value = urlRoom.toUpperCase();
@@ -307,6 +313,90 @@
 
   setInterval(() => updateLyricsPosition(), 250);
 
+  // -------------------------------------- volume por faixa (normalização)
+  // O servidor guarda um ganho por vídeo e reparte com todos. Cada navegador
+  // multiplica esse ganho pelo seu próprio volume, então ninguém perde o controle local.
+  function loadGains() {
+    try { gainsCache = JSON.parse(localStorage.getItem(GAINS_STORAGE + roomCode) || '{}') || {}; }
+    catch { gainsCache = {}; }
+    gainsRestoreAttempted = false;
+  }
+
+  function saveGains() {
+    try { localStorage.setItem(GAINS_STORAGE + roomCode, JSON.stringify(gainsCache)); } catch { /* sem espaço */ }
+  }
+
+  function currentGain(state = lastState) {
+    const id = state?.current?.videoId;
+    const value = Number(state?.gains?.[id]);
+    if (!Number.isFinite(value)) return 1;
+    return Math.max(0.4, Math.min(1.3, value));
+  }
+
+  function applyGain(state = lastState) {
+    if (!playerReady || !player?.setVolume) return;
+    const saved = Number(localStorage.getItem(STORAGE.volume));
+    const base = Number.isFinite(saved) ? saved : 80;
+    const volume = Math.max(0, Math.min(100, Math.round(base * currentGain(state))));
+    if (volume === appliedVolume) return;
+    appliedVolume = volume;
+    player.setVolume(volume);
+  }
+
+  function ensureGainPanel() {
+    if (gainPanel) return;
+    if (!$('dj-gain-style')) {
+      const style = document.createElement('style');
+      style.id = 'dj-gain-style';
+      style.textContent = `
+        .gain-panel { margin-top: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 14px; }
+        .gain-head { display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: 800; color: var(--accent-2); margin-bottom: 8px; }
+        .gain-head span:last-child { color: var(--muted); font-variant-numeric: tabular-nums; }
+        .gain-row { display: flex; gap: 8px; }
+        .gain-btn { flex: 1; height: 34px; cursor: pointer; color: #fff; background: #241f4c; border: 1px solid var(--line); border-radius: 9px; font-size: 15px; }
+        .gain-btn:hover { border-color: var(--accent); }
+        .gain-hint { color: var(--muted); font-size: 11px; margin-top: 6px; }
+      `;
+      document.head.appendChild(style);
+    }
+
+    const panel = document.createElement('section');
+    panel.className = 'gain-panel';
+    panel.innerHTML = `
+      <div class="gain-head"><span>🔊 Volume da faixa</span><span id="gain-value">100%</span></div>
+      <div class="gain-row">
+        <button id="gain-minus" class="gain-btn" type="button" title="Diminuir">−</button>
+        <button id="gain-reset" class="gain-btn" type="button" title="Voltar ao normal">↺</button>
+        <button id="gain-plus" class="gain-btn" type="button" title="Aumentar">+</button>
+      </div>
+      <div class="gain-hint">Ajusta esta música para todos sem mudar seu volume.</div>
+    `;
+    (document.querySelector('.stage') || document.body).appendChild(panel);
+    gainPanel = panel;
+    gainValueEl = $('gain-value');
+
+    $('gain-minus').addEventListener('click', () => changeGain(-0.1));
+    $('gain-plus').addEventListener('click', () => changeGain(0.1));
+    $('gain-reset').addEventListener('click', () => changeGain(1, true));
+  }
+
+  function changeGain(delta, reset = false) {
+    if (!lastState?.current) return;
+    const videoId = lastState.current.videoId;
+    const current = reset ? 1 : currentGain(lastState) + delta;
+    const value = Math.round(Math.max(0.4, Math.min(1.3, current)) * 100) / 100;
+    gainsCache[videoId] = value;
+    saveGains();
+    send('gain', { videoId, value });
+  }
+
+  function renderGainPanel(state) {
+    try { ensureGainPanel(); } catch { return; }
+    gainPanel.classList.toggle('hidden', !state.isHost);
+    if (!state.isHost) return;
+    gainValueEl.textContent = `${Math.round(currentGain(state) * 100)}%`;
+  }
+
   // --------------------------------------------------- YouTube IFrame API
 
   function loadYouTubeApi() {
@@ -331,9 +421,8 @@
       events: {
         onReady: () => {
           playerReady = true;
-          const saved = Number(localStorage.getItem(STORAGE.volume));
-          const volume = Number.isFinite(saved) ? saved : 80;
-          player.setVolume(volume);
+          appliedVolume = -1;
+          applyGain();
           player.unMute();
           if (lastState) applyState(true);
         },
@@ -358,7 +447,8 @@
     showGate(false);
     if (playerReady) {
       player.unMute();
-      player.setVolume(Number(localStorage.getItem(STORAGE.volume) ?? 80));
+      appliedVolume = -1;
+      applyGain();
       applyState(true);
     }
     toast('Áudio ativado! O player vai acompanhar o DJ.');
@@ -367,6 +457,7 @@
   function applyState(force = false) {
     if (!playerReady || !lastState) return;
     const state = lastState;
+    applyGain(state);
 
     if (!state.current) {
       if (loadedVideoId) {
@@ -588,6 +679,7 @@
 
     renderNowPlaying(state);
     try { updateLyricsForTrack(state.current); } catch { /* a letra nunca trava o player */ }
+    try { renderGainPanel(state); } catch { /* o ganho nunca trava o player */ }
     renderQueue(state);
     const savedRequests = renderRequests(state);
     // Servidor reiniciou e perdeu o histórico: o DJ devolve a cópia do navegador.
@@ -597,6 +689,20 @@
     ) {
       restoreAttempted = true;
       send('restoreRequests', { requests: savedRequests });
+    }
+    if (state.isHost && state.gains && typeof state.gains === 'object') {
+      let changed = false;
+      for (const [id, value] of Object.entries(state.gains)) {
+        if (gainsCache[id] !== value) { gainsCache[id] = value; changed = true; }
+      }
+      if (changed) saveGains();
+    }
+    if (
+      state.isHost && !gainsRestoreAttempted &&
+      !Object.keys(state.gains || {}).length && Object.keys(gainsCache).length
+    ) {
+      gainsRestoreAttempted = true;
+      send('restoreGains', { gains: gainsCache });
     }
     renderMessages(state);
     updatePlayButton();
@@ -629,6 +735,7 @@
     clockOffset = null;
     lastSeekAt = 0;
     restoreAttempted = false;
+    loadGains();
     forceNextApply = true; // alinha já no primeiro estado recebido
     connect();
     loadYouTubeApi();
@@ -748,7 +855,8 @@
     const value = Number(e.target.value);
     localStorage.setItem(STORAGE.volume, String(value));
     $('volume-value').textContent = `${value}%`;
-    player?.setVolume?.(value);
+    appliedVolume = -1;
+    applyGain();
     if (value > 0) player?.unMute?.();
   });
 
