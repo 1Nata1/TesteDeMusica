@@ -7,6 +7,7 @@ const http = require('http');
 const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer, WebSocket } = require('ws');
+const { measureVideoLoudness, loudnessEnabled } = require('./loudness');
 
 const PORT = process.env.PORT || 3000;
 const SYNC_INTERVAL_MS = 5000;
@@ -19,6 +20,8 @@ const TWITCH = {
   token: (process.env.TWITCH_OAUTH_TOKEN || '').trim(),
   room: (process.env.TWITCH_ROOM || '').trim().toUpperCase(),
   commands: (process.env.TWITCH_SR_COMMANDS || '$sr,!sr').split(',').map((c) => c.trim().toLowerCase()).filter(Boolean),
+  // Contas extras autorizadas a controlar o player pelo chat (além de mods e broadcaster).
+  admins: (process.env.TWITCH_ADMINS || '').split(',').map((c) => c.trim().toLowerCase()).filter(Boolean),
   reply: process.env.TWITCH_CHAT_REPLY !== 'false',
   ircUrl: process.env.TWITCH_IRC_URL || 'wss://irc-ws.chat.twitch.tv:443',
 };
@@ -61,10 +64,14 @@ function createRoom(code = makeCode()) {
     emptySince: null,
     current: null,
     playing: false,
+    ended: false, // música acabou sem nada na fila: espera o próximo pedido
     position: 0,
     updatedAt: Date.now(),
     queue: [],
     history: [],
+    // Ganho de volume por vídeo (0.4 a 1.3), compartilhado com todos os ouvintes.
+    gains: {},
+    manualGains: new Set(), // vídeos em que o DJ ajustou na mão: a medição não sobrescreve
     //Histórico de pedidos por usuário (chave = nome em minúsculas)
     userRequests: {},
     messages: [],
@@ -107,9 +114,11 @@ function stateFor(room, ws) {
     code: room.code,
     current: room.current,
     playing: room.playing,
+    ended: Boolean(room.ended),
     position: currentPosition(room),
     serverTime: Date.now(),
     queue: room.queue,
+    gains: room.gains || {},
     userRequests: Object.fromEntries(
       Object.entries(room.userRequests || {}).map(([user, tracks]) => [user, uniqueRequests(tracks)])
     ),
@@ -362,7 +371,9 @@ async function addTrack(room, input, requestedBy, ws) {
   }
 
   if (!rooms.has(room.code)) return;
-  if (room.queue.some((t) => t.videoId === track.videoId) || room.current?.videoId === track.videoId) {
+  const ended = Boolean(room.ended);
+  if (room.queue.some((t) => t.videoId === track.videoId) ||
+      (room.current?.videoId === track.videoId && !ended)) {
     toast(ws, 'Essa música já está na fila.');
     return;
   }
@@ -394,8 +405,46 @@ async function addTrack(room, input, requestedBy, ws) {
   const userKeys = Object.keys(room.userRequests);
   if (userKeys.length > 200) delete room.userRequests[userKeys[0]];
 
+  // Dispara a medição de loudness em segundo plano; o resultado chega depois pelo state.
+  autoGain(room, track);
+
+  // A música anterior acabou sem fila: este pedido vira a próxima automaticamente.
+  if (ended) playNext(room);
+
   systemMessage(room, `${requestedBy} adicionou: ${track.title}`);
   return track;
+}
+
+function clampGain(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 1;
+  return Math.max(0.4, Math.min(1.3, Math.round(n * 100) / 100));
+}
+
+// Preenche o ganho automaticamente com base na loudness medida da faixa.
+// O valor manual do DJ sempre tem prioridade.
+function autoGain(room, track) {
+  const videoId = track?.videoId;
+  if (!loudnessEnabled || !videoId) return;
+  measureVideoLoudness(videoId).then((result) => {
+    if (!result || !rooms.has(room.code)) return;
+    if (!room.manualGains) room.manualGains = new Set();
+    if (room.manualGains.has(videoId)) return;
+    if (!room.gains) room.gains = {};
+    if (room.gains[videoId] === result.gain) return;
+    room.gains[videoId] = result.gain;
+    broadcastState(room);
+
+    // Aviso só para o DJ: deixa claro que o volume foi ajustado pela medição.
+    const host = [...room.clients].find((client) => client.clientId === room.hostId);
+    if (!host) return;
+    const arrow = result.gain < 1 ? '↓' : result.gain > 1 ? '↑' : '=';
+    const title = String(track.title || videoId).slice(0, 60);
+    send(host, {
+      type: 'toast',
+      text: `🔊 ${arrow} Volume de “${title}” ajustado automaticamente para ${Math.round(result.gain * 100)}%`,
+    });
+  });
 }
 
 function playNext(room) {
@@ -404,6 +453,7 @@ function playNext(room) {
   room.current = room.queue.shift();
   room.position = 0;
   room.playing = true;
+  room.ended = false;
   room.updatedAt = Date.now();
   return true;
 }
@@ -414,6 +464,32 @@ function requireHost(room, ws) {
     return false;
   }
   return true;
+}
+
+// Ações de controle usadas tanto pelo DJ (WebSocket) quanto pelos moderadores (Twitch).
+// Quem chama decide como avisar o usuário e quando transmitir o novo estado.
+function pauseRoom(room) {
+  room.position = currentPosition(room);
+  room.playing = false;
+  room.ended = false;
+  room.updatedAt = Date.now();
+  return { ok: true, message: '⏸️ Player pausado.' };
+}
+
+function nextRoom(room) {
+  if (!playNext(room)) return { ok: false, message: 'Não há próxima música na fila.' };
+  return { ok: true, message: `⏭️ Tocando agora: ${room.current.title}` };
+}
+
+function previousRoom(room) {
+  if (!room.history.length) return { ok: false, message: 'Não há música anterior.' };
+  if (room.current) room.queue.unshift(room.current);
+  room.current = room.history.pop();
+  room.position = 0;
+  room.playing = true;
+  room.ended = false;
+  room.updatedAt = Date.now();
+  return { ok: true, message: `⏮️ Voltando para: ${room.current.title}` };
 }
 
 function handleAction(ws, room, msg) {
@@ -462,6 +538,21 @@ function handleAction(ws, room, msg) {
       sendState(ws, room);
       break;
 
+    // O player do DJ avisou que a música terminou. Se houver fila, avança;
+    // senão fica "aguardando" e o próximo pedido começa sozinho.
+    case 'ended': {
+      if (!requireHost(room, ws)) return;
+      if (!room.playing || !room.current) return;
+      if (msg.videoId && room.current.videoId !== msg.videoId) return;
+      if (!playNext(room)) {
+        room.playing = false;
+        room.ended = true;
+        room.updatedAt = Date.now();
+      }
+      broadcastState(room);
+      break;
+    }
+
     case 'play':
       if (!requireHost(room, ws)) return;
       if (!room.current && !playNext(room)) {
@@ -469,43 +560,41 @@ function handleAction(ws, room, msg) {
         return;
       }
       room.playing = true;
+      room.ended = false;
       room.updatedAt = Date.now();
       broadcastState(room);
       break;
 
-    case 'pause':
+    case 'pause': {
       if (!requireHost(room, ws)) return;
-      room.position = currentPosition(room);
-      room.playing = false;
-      room.updatedAt = Date.now();
-      broadcastState(room);
-      break;
-
-    case 'next':
-      if (!requireHost(room, ws)) return;
-      if (!playNext(room)) toast(ws, 'Não há próxima música.');
+      const result = pauseRoom(room);
+      if (!result.ok) toast(ws, result.message);
       else broadcastState(room);
       break;
+    }
 
-    case 'previous':
+    case 'next': {
       if (!requireHost(room, ws)) return;
-      if (!room.history.length) {
-        toast(ws, 'Não há música anterior.');
-        return;
-      }
-      if (room.current) room.queue.unshift(room.current);
-      room.current = room.history.pop();
-      room.position = 0;
-      room.playing = true;
-      room.updatedAt = Date.now();
-      broadcastState(room);
+      const result = nextRoom(room);
+      if (!result.ok) toast(ws, result.message);
+      else broadcastState(room);
       break;
+    }
+
+    case 'previous': {
+      if (!requireHost(room, ws)) return;
+      const result = previousRoom(room);
+      if (!result.ok) toast(ws, result.message);
+      else broadcastState(room);
+      break;
+    }
 
     case 'seek': {
       if (!requireHost(room, ws)) return;
       const seconds = Number(msg.position);
       if (!Number.isFinite(seconds) || seconds < 0 || seconds > 12 * 3600) return;
       room.position = seconds;
+      room.ended = false;
       room.updatedAt = Date.now();
       broadcastState(room);
       break;
@@ -548,6 +637,43 @@ function handleAction(ws, room, msg) {
       const keys = Object.keys(room.userRequests);
       if (keys.length > 200) {
         for (const key of keys.slice(0, keys.length - 200)) delete room.userRequests[key];
+        changed = true;
+      }
+      if (changed) broadcastState(room);
+      break;
+    }
+
+    // Ganho de volume da faixa atual: o DJ ajusta uma vez e todos os ouvintes recebem.
+    case 'gain': {
+      if (!requireHost(room, ws)) return;
+      const videoId = String(msg.videoId || room.current?.videoId || '').slice(0, 32);
+      if (!videoId) return;
+      if (!room.gains) room.gains = {};
+      if (!room.manualGains) room.manualGains = new Set();
+      room.manualGains.add(videoId);
+      room.gains[videoId] = clampGain(msg.value);
+      broadcastState(room);
+      break;
+    }
+
+    // Após um restart do Render, o DJ devolve os ganhos salvos no navegador.
+    case 'restoreGains': {
+      if (!requireHost(room, ws)) return;
+      const incoming = msg.gains && typeof msg.gains === 'object' ? msg.gains : {};
+      if (!room.gains) room.gains = {};
+      let changed = false;
+      for (const [id, value] of Object.entries(incoming)) {
+        const videoId = String(id).slice(0, 32);
+        if (!videoId || !Number.isFinite(Number(value))) continue;
+        const gain = clampGain(value);
+        if (room.gains[videoId] !== gain) {
+          room.gains[videoId] = gain;
+          changed = true;
+        }
+      }
+      const ids = Object.keys(room.gains);
+      if (ids.length > 200) {
+        for (const id of ids.slice(0, ids.length - 200)) delete room.gains[id];
         changed = true;
       }
       if (changed) broadcastState(room);
@@ -670,6 +796,32 @@ function replyTwitch(text) {
   twitchWs.send(`PRIVMSG #${TWITCH.channel} :${clean}`);
 }
 
+const CHAT_CONTROLS = {
+  $pausar: pauseRoom, '!pausar': pauseRoom, $pause: pauseRoom,
+  $pular: nextRoom, '!pular': nextRoom, $next: nextRoom,
+  $voltar: previousRoom, '!voltar': previousRoom, $previous: previousRoom,
+};
+
+const HELP_COMMANDS = new Set(['$comandos', '!comandos', '$help', '!help', '$ajuda', '!ajuda']);
+
+const twitchDeniedAt = new Map();
+
+function canControlFromChat(tags, username) {
+  const badges = String(tags?.badges || '')
+    .split(',')
+    .map((badge) => badge.split('/')[0].trim().toLowerCase());
+  if (badges.includes('broadcaster') || badges.includes('moderator')) return true;
+  return TWITCH.admins.includes(String(username || '').toLowerCase());
+}
+
+function denyChatControl(username) {
+  const key = String(username || '').toLowerCase();
+  const now = Date.now();
+  if (now - (twitchDeniedAt.get(key) || 0) < 30000) return; // evita flood no chat
+  twitchDeniedAt.set(key, now);
+  replyTwitch(`@${key}: esse comando é só para moderadores do chat.`);
+}
+
 function handleTwitchLine(line) {
   line = line.trim();
   if (!line) return;
@@ -683,14 +835,48 @@ function handleTwitchLine(line) {
     return;
   }
 
-  const match = line.match(/^:([^!]+)!.*?PRIVMSG #([^ ]+) :(.*)$/);
+  const match = line.match(/^(?:@([^ ]+) )?:([^!]+)!.*?PRIVMSG #([^ ]+) :(.*)$/);
   if (!match) return;
 
-  const [, username, channel, message] = match;
+  const [, rawTags, username, channel, message] = match;
   if (channel !== TWITCH.channel) return;
+
+  const tags = {};
+  for (const part of String(rawTags || '').split(';')) {
+    if (!part) continue;
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    tags[part.slice(0, eq)] = part.slice(eq + 1);
+  }
 
   const [command, ...rest] = message.trim().split(/\s+/);
   const cmd = (command || '').toLowerCase();
+
+  // Ajuda rápida, separando o que qualquer pessoa pode usar do que é só para mods.
+  if (HELP_COMMANDS.has(cmd)) {
+    const pedidos = TWITCH.commands.join(' / ');
+    replyTwitch(`Comandos para todos: ${pedidos} (nome ou link) · $lista [@usuario] (pedidos/ranking) · $comandos (esta ajuda)`);
+    replyTwitch('Só moderadores/broadcaster: $pausar, $pular, $voltar (ou $pause, $next, $previous).');
+    return;
+  }
+
+  // Moderadores (e o broadcaster) controlam o player sem precisar entrar na sala.
+  const control = CHAT_CONTROLS[cmd];
+  if (control) {
+    if (!canControlFromChat(tags, username)) {
+      denyChatControl(username);
+      return;
+    }
+    const room = getRoom(TWITCH.room);
+    if (!room) {
+      replyTwitch('A sala do DJ ainda não está aberta.');
+      return;
+    }
+    const result = control(room);
+    broadcastState(room);
+    replyTwitch(result.ok ? `${result.message} (por @${username})` : result.message);
+    return;
+  }
 
   // Consulta ao gosto musical da pessoa: $lista @usuario (ou só $lista para o ranking)
   if (cmd === '$lista' || cmd === '!lista' || cmd === '$list' || cmd === '!list') {
@@ -761,6 +947,7 @@ function connectTwitch() {
     console.log(`Twitch: conectando em #${TWITCH.channel} → sala ${TWITCH.room}`);
     twitchWs.send(`PASS oauth:${token}`);
     twitchWs.send(`NICK ${TWITCH.nick || TWITCH.channel}`);
+    twitchWs.send('CAP REQ :twitch.tv/tags'); // necessário para receber "badges" (moderador)
     twitchWs.send(`JOIN #${TWITCH.channel}`);
   });
 
@@ -835,6 +1022,7 @@ server.listen(PORT, () => {
 
   console.log(`DJ Sync rodando em http://localhost:${PORT}`);
   if (TWITCH.room) console.log(`Sala da Twitch: ${TWITCH.room} → http://localhost:${PORT}/r/${TWITCH.room}`);
+  console.log(loudnessEnabled ? 'Normalização automática de volume: ativada' : 'Normalização automática de volume: desativada');
 
   if (TWITCH.channel && TWITCH.token && TWITCH.room) {
     connectTwitch();
