@@ -339,10 +339,9 @@
         },
         onStateChange: (event) => {
           updatePlayButton();
-          // 0 = ENDED: o DJ avança a fila (ou pausa se não houver próxima).
+          // 0 = ENDED: o servidor avança a fila ou fica aguardando o próximo pedido.
           if (event.data === 0 && lastState?.isHost && loadedVideoId === lastState.current?.videoId) {
-            if (lastState.queue?.length) send('next');
-            else send('pause');
+            send('ended', { videoId: lastState.current.videoId });
           }
         },
       },
@@ -570,7 +569,9 @@
       return;
     }
     $('np-title').textContent = track.title;
-    $('np-meta').textContent = `${track.author ? `${track.author} · ` : ''}pedido por ${track.requestedBy}`;
+    $('np-meta').textContent = state.ended
+      ? 'Música terminada · aguardando o próximo pedido'
+      : `${track.author ? `${track.author} · ` : ''}pedido por ${track.requestedBy}`;
     $('np-thumb').src = `https://i.ytimg.com/vi/${encodeURIComponent(track.videoId)}/mqdefault.jpg`;
   }
 
