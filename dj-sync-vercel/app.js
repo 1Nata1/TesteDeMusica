@@ -43,6 +43,7 @@
   let lastSeekAt = 0;
   let restoreAttempted = false;
   let appliedVolume = -1;
+  let volumeFadeTimer = null;
   const GAINS_STORAGE = 'dj-sync-gains:';
   let gainsCache = {};
   let gainsRestoreAttempted = false;
@@ -333,14 +334,35 @@
     return Math.max(0.4, Math.min(1.3, value));
   }
 
-  function applyGain(state = lastState) {
+  function applyGain(state = lastState, smooth = false) {
     if (!playerReady || !player?.setVolume) return;
     const saved = Number(localStorage.getItem(STORAGE.volume));
     const base = Number.isFinite(saved) ? saved : 80;
     const volume = Math.max(0, Math.min(100, Math.round(base * currentGain(state))));
     if (volume === appliedVolume) return;
-    appliedVolume = volume;
-    player.setVolume(volume);
+
+    clearInterval(volumeFadeTimer);
+    volumeFadeTimer = null;
+    const from = appliedVolume < 0 ? volume : appliedVolume;
+    if (!smooth || !state?.playing || Math.abs(volume - from) <= 8) {
+      appliedVolume = volume;
+      player.setVolume(volume);
+      return;
+    }
+
+    // A medição automática pode chegar no meio da música: sobe/desce devagar para não estalar.
+    const steps = 8;
+    let step = 0;
+    volumeFadeTimer = setInterval(() => {
+      step++;
+      appliedVolume = Math.round(from + (volume - from) * (step / steps));
+      player.setVolume(appliedVolume);
+      if (step >= steps) {
+        clearInterval(volumeFadeTimer);
+        volumeFadeTimer = null;
+        appliedVolume = volume;
+      }
+    }, 80);
   }
 
   function ensureGainPanel() {
@@ -369,7 +391,7 @@
         <button id="gain-reset" class="gain-btn" type="button" title="Voltar ao normal">↺</button>
         <button id="gain-plus" class="gain-btn" type="button" title="Aumentar">+</button>
       </div>
-      <div class="gain-hint">Ajusta esta música para todos sem mudar seu volume.</div>
+      <div class="gain-hint">Medido automaticamente · ajuste se precisar.</div>
     `;
     (document.querySelector('.stage') || document.body).appendChild(panel);
     gainPanel = panel;
@@ -457,7 +479,7 @@
   function applyState(force = false) {
     if (!playerReady || !lastState) return;
     const state = lastState;
-    applyGain(state);
+    applyGain(state, true);
 
     if (!state.current) {
       if (loadedVideoId) {
