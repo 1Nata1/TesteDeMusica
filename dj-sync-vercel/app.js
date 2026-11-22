@@ -98,6 +98,215 @@
     return Math.max(0, state.position + (state.playing ? (now - state.serverTime) / 1000 : 0));
   }
 
+  // -------------------------------------------------------- letra sincronizada
+  // Tudo aqui vive no app.js: o painel e os estilos são criados em runtime para
+  // que um HTML desatualizado nunca mais quebre o player.
+
+  const LYRICS_STORAGE = 'dj-sync-lyrics';
+  const lyricsCache = new Map();
+  let lyricsPanel = null;
+  let lyricsLinesEl = null;
+  let lyricsStatusEl = null;
+  let lyricsLines = [];
+  let lyricsActive = -1;
+  let lyricsVideoId = null;
+  let lyricsSeq = 0;
+
+  try {
+    const savedLyrics = JSON.parse(localStorage.getItem(LYRICS_STORAGE) || '{}') || {};
+    for (const [id, entry] of Object.entries(savedLyrics)) {
+      if (entry && Array.isArray(entry.lines)) lyricsCache.set(id, entry);
+    }
+  } catch { /* cache inválido */ }
+
+  function saveLyricsCache(videoId, entry) {
+    lyricsCache.set(videoId, entry);
+    try {
+      const obj = Object.fromEntries(lyricsCache);
+      const ids = Object.keys(obj);
+      if (ids.length > 40) {
+        for (const id of ids.slice(0, ids.length - 40)) delete obj[id];
+      }
+      localStorage.setItem(LYRICS_STORAGE, JSON.stringify(obj));
+    } catch { /* sem espaço */ }
+  }
+
+  function cleanLyricText(value) {
+    return String(value || '')
+      .replace(/\s*[\[(](?:official|video|audio|mv|hd|hq|lyrics?|remaster(?:ed)?|visualizer|live|4k|clip)[^\])]*[\])]/gi, ' ')
+      .replace(/\s*[-–—]\s*(?:official|video|audio|lyrics?)[^\n]*/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function trackQuery(track) {
+    let title = cleanLyricText(track?.title);
+    const parts = title.split(/\s+[-–—]\s+/);
+    if (parts.length > 1) title = parts.slice(-1)[0]; // "Artista - Música" → "Música"
+    const artist = cleanLyricText(track?.author || parts[0] || '');
+    return { title: title.trim(), artist: artist.trim() };
+  }
+
+  function parseLrc(lrc) {
+    if (typeof lrc !== 'string' || !lrc) return [];
+    let offset = 0;
+    const offsetMatch = lrc.match(/^\[offset:([+-]?\d+)\]/im);
+    if (offsetMatch) offset = Number(offsetMatch[1]) / 1000;
+
+    const lines = [];
+    for (const raw of lrc.split(/\r?\n/)) {
+      const stamps = [...raw.matchAll(/\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]/g)];
+      if (!stamps.length) continue;
+      const text = raw.replace(/\[[^\]]*\]/g, '').trim().replace(/\s+/g, ' ');
+      if (!text) continue;
+      for (const stamp of stamps) {
+        const seconds = Number(stamp[1]) * 60 + Number(stamp[2]) +
+          Number((stamp[3] || '0').padEnd(3, '0')) / 1000;
+        lines.push({ time: Math.max(0, seconds + offset), text });
+      }
+    }
+    return lines.sort((a, b) => a.time - b.time);
+  }
+
+  function ensureLyricsPanel() {
+    if (lyricsPanel) return;
+    if (!$('dj-lyrics-style')) {
+      const style = document.createElement('style');
+      style.id = 'dj-lyrics-style';
+      style.textContent = `
+        .lyrics-panel { margin-top: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; }
+        .lyrics-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; font-weight: 800; color: var(--accent-2); letter-spacing: .4px; margin-bottom: 8px; }
+        .lyrics-status { font-size: 11px; font-weight: 400; color: var(--muted); letter-spacing: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+        .lyrics-scroll { position: relative; max-height: 150px; overflow-y: auto; scroll-behavior: smooth; }
+        .lyric-line { font-size: 14px; line-height: 1.45; color: var(--muted); padding: 3px 6px; border-radius: 6px; transition: color .15s, background .15s; }
+        .lyric-line.active { color: #fff; background: rgba(168,85,247,.20); font-weight: 700; }
+        .lyrics-empty { color: var(--muted); font-size: 12px; padding: 6px 4px; }
+      `;
+      document.head.appendChild(style);
+    }
+
+    const panel = document.createElement('section');
+    panel.className = 'lyrics-panel';
+    panel.innerHTML = `
+      <div class="lyrics-head">
+        <span>🎵 Letra</span>
+        <span id="lyrics-status" class="lyrics-status">—</span>
+      </div>
+      <div id="lyrics-lines" class="lyrics-scroll"></div>
+    `;
+    (document.querySelector('.stage') || document.body).appendChild(panel);
+    lyricsPanel = panel;
+    lyricsLinesEl = $('lyrics-lines');
+    lyricsStatusEl = $('lyrics-status');
+  }
+
+  function applyLyrics(entry, videoId) {
+    if (lyricsVideoId !== videoId) return;
+    lyricsLines = entry.lines || [];
+    lyricsActive = -1;
+    if (!lyricsLines.length) {
+      lyricsStatusEl.textContent = entry.instrumental ? 'instrumental' : 'sem letra';
+      lyricsLinesEl.innerHTML = `<div class="lyrics-empty">${
+        entry.instrumental ? 'Música instrumental.' : 'Letra não encontrada para esta música.'
+      }</div>`;
+      return;
+    }
+    const credit = [entry.artist, entry.title].filter(Boolean).join(' · ');
+    lyricsStatusEl.textContent = credit || 'sincronizada';
+    lyricsLinesEl.innerHTML = lyricsLines
+      .map((line, i) => `<div class="lyric-line" data-i="${i}">${esc(line.text)}</div>`)
+      .join('');
+    updateLyricsPosition(true);
+  }
+
+  async function searchLyrics(title, artist, videoId, seq) {
+    try {
+      const params = new URLSearchParams({ track_name: title });
+      if (artist) params.set('artist_name', artist);
+
+      let response = await fetch(`https://lrclib.net/api/get?${params}`);
+      let record = response.ok ? await response.json() : null;
+
+      if (!record?.syncedLyrics) {
+        response = await fetch(`https://lrclib.net/api/search?${params}`);
+        if (response.ok) {
+          const list = await response.json();
+          record = (Array.isArray(list) ? list : []).find((item) => item.syncedLyrics) || list?.[0] || null;
+        }
+      }
+
+      if (seq !== lyricsSeq || lyricsVideoId !== videoId) return;
+      const entry = {
+        lines: record?.syncedLyrics ? parseLrc(record.syncedLyrics) : [],
+        title: record?.trackName || title,
+        artist: record?.artistName || artist,
+        instrumental: Boolean(record?.instrumental),
+      };
+      saveLyricsCache(videoId, entry);
+      applyLyrics(entry, videoId);
+    } catch {
+      if (seq !== lyricsSeq || lyricsVideoId !== videoId) return;
+      lyricsStatusEl.textContent = 'letra indisponível';
+      lyricsLinesEl.innerHTML = '<div class="lyrics-empty">Não foi possível buscar a letra agora.</div>';
+    }
+  }
+
+  function updateLyricsForTrack(track) {
+    try { ensureLyricsPanel(); } catch { return; }
+    const id = track?.videoId || null;
+    if (lyricsVideoId === id) return;
+
+    lyricsVideoId = id;
+    lyricsLines = [];
+    lyricsActive = -1;
+    const seq = ++lyricsSeq;
+    lyricsLinesEl.innerHTML = '<div class="lyrics-empty">Nada tocando ainda.</div>';
+
+    if (!track) {
+      lyricsStatusEl.textContent = '—';
+      return;
+    }
+
+    const cached = lyricsCache.get(id);
+    if (cached) {
+      applyLyrics(cached, id);
+      return;
+    }
+
+    const query = trackQuery(track);
+    if (!query.title) {
+      lyricsStatusEl.textContent = 'sem letra';
+      return;
+    }
+    lyricsStatusEl.textContent = 'buscando letra...';
+    searchLyrics(query.title, query.artist, id, seq);
+  }
+
+  function updateLyricsPosition(force = false) {
+    if (!lyricsPanel || !lyricsLines.length || !lastState?.current) return;
+    if (lastState.current.videoId !== lyricsVideoId) return;
+
+    const position = expectedPosition(lastState);
+    let index = -1;
+    for (let i = 0; i < lyricsLines.length; i++) {
+      if (lyricsLines[i].time <= position + 0.2) index = i;
+      else break;
+    }
+    if (index === lyricsActive && !force) return;
+
+    if (lyricsActive >= 0) lyricsLinesEl.children[lyricsActive]?.classList.remove('active');
+    lyricsActive = index;
+    if (index < 0) return;
+
+    const line = lyricsLinesEl.children[index];
+    if (!line) return;
+    line.classList.add('active');
+    const target = line.offsetTop - lyricsLinesEl.clientHeight / 2 + line.clientHeight / 2;
+    lyricsLinesEl.scrollTop = Math.max(0, target);
+  }
+
+  setInterval(() => updateLyricsPosition(), 250);
+
   // --------------------------------------------------- YouTube IFrame API
 
   function loadYouTubeApi() {
@@ -377,6 +586,7 @@
     $('allow-requests').checked = state.settings.allowRequests;
 
     renderNowPlaying(state);
+    try { updateLyricsForTrack(state.current); } catch { /* a letra nunca trava o player */ }
     renderQueue(state);
     const savedRequests = renderRequests(state);
     // Servidor reiniciou e perdeu o histórico: o DJ devolve a cópia do navegador.
